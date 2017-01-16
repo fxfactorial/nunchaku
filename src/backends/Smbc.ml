@@ -506,16 +506,18 @@ let convert_model (m:A_res.model): (_,_) Model.t =
          Model.add_value m (a,b,k))
     Model.empty m
 
-let convert_res ~info (res:A_res.t): (_,_) Res.t * S.shortcut = match res with
+let convert_res ~info ~meta (res:A_res.t): (_,_) Res.t * S.shortcut = match res with
   | A_res.Timeout -> Res.Unknown [Res.U_timeout info], S.No_shortcut
   | A_res.Unknown s -> Res.Unknown [Res.U_other (info,s)], S.No_shortcut
+  | A_res.Unsat when meta.ProblemMetadata.unsat_means_unknown ->
+    Res.Unknown [Res.U_incomplete info], S.No_shortcut
   | A_res.Unsat -> Res.Unsat info, S.Shortcut
   | A_res.Sat m ->
     let m = convert_model m in
     Res.Sat (m,info), S.Shortcut
 
 (* parse [stdout, errcode] into a proper result *)
-let parse_res ~info (out:string) (errcode:int): (term,ty) Res.t * S.shortcut =
+let parse_res ~info ~meta (out:string) (errcode:int): (term,ty) Res.t * S.shortcut =
   if errcode<>0
   then
     let msg = Printf.sprintf "smbc failed with errcode %d, output:\n%s" errcode out in
@@ -525,7 +527,7 @@ let parse_res ~info (out:string) (errcode:int): (term,ty) Res.t * S.shortcut =
       let lexbuf = Lexing.from_string out in
       Location.set_file lexbuf "<output of smbc>";
       let res = Tip_parser.parse_smbc_res Tip_lexer.token lexbuf in
-      convert_res ~info res
+      convert_res ~info ~meta res
     with e ->
       Res.Error (e,info), S.Shortcut
   )
@@ -555,42 +557,45 @@ let solve ~deadline pb =
         timeout depth_step_
     in
     Utils.debugf ~section 5 "smbc call: `%s`" (fun k->k cmd);
-    let fut =
-      S.popen cmd
-        ~f:(fun (stdin,stdout) ->
-          Utils.debugf ~lock:true ~section 5 "smbc input:@ @[<v>%a@]" (fun k->k print_pb pb);
-          (* send problem *)
-          let fmt = Format.formatter_of_out_channel stdin in
-          Format.fprintf fmt "%a@." print_pb pb;
-          flush stdin;
-          close_out stdin;
-          CCIO.read_all stdout)
-    in
-    match S.Fut.get fut with
-      | S.Fut.Done (E.Ok (stdout, errcode)) ->
-        Utils.debugf ~lock:true ~section 2
-          "@[<2>smbc exited with %d, stdout:@ `%s`@]"
-          (fun k->k errcode stdout);
-        let info = mk_info() in
-        parse_res ~info stdout errcode
-      | S.Fut.Fail (Out_of_scope msg)
-      | S.Fut.Done (E.Error (Out_of_scope msg)) ->
-        Utils.debugf ~section 3 "@[out of scope because:@ %s@]"
-          (fun k->k msg);
-        let info = mk_info ~msg () in
-        Res.Unknown [Res.U_out_of_scope info], S.No_shortcut (* out of scope *)
-      | S.Fut.Done (E.Error e) ->
-        let info = mk_info() in
-        Res.Error (e,info), S.Shortcut
-      | S.Fut.Stopped ->
-        let info = mk_info() in
-        Res.Unknown [Res.U_timeout info], S.No_shortcut
-      | S.Fut.Fail e ->
-        (* return error *)
-        Utils.debugf ~lock:true ~section 1 "@[<2>smbc failed with@ `%s`@]"
-          (fun k->k (Printexc.to_string e));
-        let info = mk_info() in
-        Res.Error (e,info), S.Shortcut
+    (* print problem into a TIP string;
+       also serves to check Out_of_scope *)
+    try
+      let pb_string = CCFormat.sprintf "@[<v>%a@]@." print_pb pb in
+      let fut =
+        S.popen cmd
+          ~f:(fun (stdin,stdout) ->
+            Utils.debugf ~lock:true ~section 5 "smbc input:@ %s" (fun k->k pb_string);
+            (* send problem *)
+            output_string stdin pb_string;
+            flush stdin;
+            close_out stdin;
+            CCIO.read_all stdout)
+      in
+      begin match S.Fut.get fut with
+        | S.Fut.Done (E.Ok (stdout, errcode)) ->
+          Utils.debugf ~lock:true ~section 2
+            "@[<2>smbc exited with %d, stdout:@ `%s`@]"
+            (fun k->k errcode stdout);
+          let info = mk_info() in
+          parse_res ~info ~meta:(Problem.metadata pb) stdout errcode
+        | S.Fut.Done (E.Error e) ->
+          let info = mk_info() in
+          Res.Error (e,info), S.Shortcut
+        | S.Fut.Stopped ->
+          let info = mk_info() in
+          Res.Unknown [Res.U_timeout info], S.No_shortcut
+        | S.Fut.Fail e ->
+          (* return error *)
+          Utils.debugf ~lock:true ~section 1 "@[<2>smbc failed with@ `%s`@]"
+            (fun k->k (Printexc.to_string e));
+          let info = mk_info() in
+          Res.Error (e,info), S.Shortcut
+      end
+    with Out_of_scope msg ->
+      Utils.debugf ~section 3 "@[out of scope because:@ %s@]"
+        (fun k->k msg);
+      let info = mk_info ~msg () in
+      Res.Unknown [Res.U_out_of_scope info], S.No_shortcut (* out of scope *)
   )
 
 let call_real ~print_model ~prio problem =

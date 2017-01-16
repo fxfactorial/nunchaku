@@ -1552,7 +1552,7 @@ module Util(T : S)
               | _ ->
                 failwith "cannot infer type, wrong argument to DataSelect"
             end
-          | `Undefined_self (_,t) ->aux t
+          | `Undefined_self (_,t) -> aux t
           | `Undefined_atom (_,ty) -> ty
           | `Guard (t, _) -> aux t
         end
